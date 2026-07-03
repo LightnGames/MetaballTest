@@ -1,5 +1,7 @@
 @echo off
 setlocal
+rem Always build in the folder containing this script
+cd /d "%~dp0"
 rem Locate latest Visual Studio via vswhere and set up the x64 dev environment
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -property installationPath`) do set "VSDIR=%%i"

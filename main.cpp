@@ -26,6 +26,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -54,6 +55,8 @@ struct Params
     float screenH;
     float dist01;          // スライダー1のつまみ位置 [0,1]
     float blend01;         // スライダー2のつまみ位置 [0,1]
+    float dbgW;            // デバッグテキストテクスチャのサイズ (px)
+    float dbgH;
 };
 
 //----------------------------------------------------------------------------
@@ -74,6 +77,7 @@ static ComPtr<ID3D12RootSignature> gRootSig;
 static ComPtr<ID3D12PipelineState> gPsoParticle;  // Pass1 (加算ブレンド)
 static ComPtr<ID3D12PipelineState> gPsoThreshold; // Pass2
 static ComPtr<ID3D12PipelineState> gPsoUi;        // Pass3 (スライダーUI)
+static ComPtr<ID3D12PipelineState> gPsoDbg;       // Pass4 (デバッグテキスト)
 static ComPtr<ID3D12Fence>         gFence;
 static UINT64                      gFenceValue = 0;
 static HANDLE                      gFenceEvent = nullptr;
@@ -93,6 +97,22 @@ static const int kSlider1Y = 40;  // スライダー1 (距離) のY座標
 static const int kSlider2Y = 80;  // スライダー2 (ブレンド距離) のY座標
 static const int kHitHalfH = 16;  // ヒットテストの上下半幅
 static int gDrag = 0;             // 0=なし, 1=スライダー1, 2=スライダー2
+
+//----------------------------------------------------------------------------
+// デバッグテキスト表示 (cbuffer Params の中身を左上に描く)
+//   GDIでDIBに白文字を描き、毎フレームテクスチャへアップロードして
+//   シェーダー (PSDebugText) で合成する
+//----------------------------------------------------------------------------
+static const UINT kDbgW     = 256;       // テクスチャサイズ
+static const UINT kDbgH     = 248;
+static const UINT kDbgPitch = kDbgW * 4; // 1024 = D3D12の256アライン要件を満たす
+
+static ComPtr<ID3D12Resource> gDbgTex;              // シェーダーが読むテクスチャ
+static ComPtr<ID3D12Resource> gDbgUpload;           // CPU書き込み用アップロードバッファ
+static void*                  gDbgUploadPtr = nullptr;
+static UINT                   gSrvStride = 0;
+static HDC                    gDbgDC   = nullptr;   // GDI描画先 (DIBセクション)
+static void*                  gDbgBits = nullptr;
 
 //----------------------------------------------------------------------------
 static void ThrowIfFailed(HRESULT hr, const char* msg)
@@ -211,6 +231,121 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* res,
 }
 
 //----------------------------------------------------------------------------
+// デバッグテキストの初期化 (GDIオブジェクト + テクスチャ + アップロードバッファ)
+//----------------------------------------------------------------------------
+static void InitDebugText()
+{
+    // GDI: 32bpp トップダウンDIB。白文字/黒地で描き、Rチャンネルを
+    // シェーダー側で不透明度として使う
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = (LONG)kDbgW;
+    bmi.bmiHeader.biHeight      = -(LONG)kDbgH; // 負 = トップダウン (行0が上端)
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    gDbgDC = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(gDbgDC, &bmi, DIB_RGB_COLORS, &gDbgBits, nullptr, 0);
+    SelectObject(gDbgDC, bmp);
+
+    // グレースケールAA (ClearTypeだと色縁が出るため)
+    HFONT font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    SelectObject(gDbgDC, font);
+    SetTextColor(gDbgDC, RGB(255, 255, 255));
+    SetBkMode(gDbgDC, TRANSPARENT);
+
+    // シェーダーが読むテクスチャ (DIBと同じ BGRA 並びのフォーマット)
+    {
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width  = kDbgW;
+        desc.Height = kDbgH;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        ThrowIfFailed(gDevice->CreateCommittedResource(
+                          &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                          IID_PPV_ARGS(&gDbgTex)),
+                      "CreateCommittedResource(DbgTex)");
+
+        // SRV (ヒープの2番目 = t1)
+        D3D12_CPU_DESCRIPTOR_HANDLE srv = gSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        srv.ptr += gSrvStride;
+        gDevice->CreateShaderResourceView(gDbgTex.Get(), nullptr, srv);
+    }
+
+    // アップロードバッファ (常時マップ)
+    {
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width  = (UINT64)kDbgPitch * kDbgH;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        ThrowIfFailed(gDevice->CreateCommittedResource(
+                          &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                          IID_PPV_ARGS(&gDbgUpload)),
+                      "CreateCommittedResource(DbgUpload)");
+        ThrowIfFailed(gDbgUpload->Map(0, nullptr, &gDbgUploadPtr), "Map(DbgUpload)");
+    }
+}
+
+//----------------------------------------------------------------------------
+// cbuffer Params の中身をGDIで描いてアップロードバッファへ書き込む
+// (毎フレームGPU完了を待つ方式なので、この時点でバッファはGPU未使用)
+//----------------------------------------------------------------------------
+static void UpdateDebugText(const Params& p)
+{
+    const struct { const wchar_t* name; float value; } items[] = {
+        { L"distance",       p.distance       },
+        { L"aspect",         p.aspect         },
+        { L"quadHalf",       p.quadHalf       },
+        { L"ballRadius",     p.ballRadius     },
+        { L"blend",          p.blend          },
+        { L"particleCutoff", p.particleCutoff },
+        { L"cutoff",         p.cutoff         },
+        { L"stroke",         p.stroke         },
+        { L"screenW",        p.screenW        },
+        { L"screenH",        p.screenH        },
+        { L"dist01",         p.dist01         },
+        { L"blend01",        p.blend01        },
+        { L"dbgW",           p.dbgW           },
+        { L"dbgH",           p.dbgH           },
+    };
+
+    memset(gDbgBits, 0, (size_t)kDbgPitch * kDbgH); // DIBのストライド == kDbgPitch
+
+    wchar_t line[64];
+    swprintf_s(line, L"cbuffer Params");
+    TextOutW(gDbgDC, 8, 6, line, (int)wcslen(line));
+    for (int i = 0; i < (int)_countof(items); ++i)
+    {
+        swprintf_s(line, L" %-15s: %9.4f", items[i].name, items[i].value);
+        TextOutW(gDbgDC, 8, 24 + i * 15, line, (int)wcslen(line));
+    }
+    GdiFlush(); // GDIのバッチを吐き出してからDIBのビットを読む
+
+    memcpy(gDbgUploadPtr, gDbgBits, (size_t)kDbgPitch * kDbgH);
+}
+
+//----------------------------------------------------------------------------
 // D3D12 初期化
 //----------------------------------------------------------------------------
 static void InitD3D12()
@@ -264,13 +399,14 @@ static void InitD3D12()
                   "CreateDescriptorHeap(RTV)");
     gRtvStride = gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-    // SRVヒープ (シェーダー可視): 蓄積RTのSRV
+    // SRVヒープ (シェーダー可視): [0]=蓄積RT, [1]=デバッグテキスト
     D3D12_DESCRIPTOR_HEAP_DESC srvDesc = {};
     srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvDesc.NumDescriptors = 1;
+    srvDesc.NumDescriptors = 2;
     srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(gDevice->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&gSrvHeap)),
                   "CreateDescriptorHeap(SRV)");
+    gSrvStride = gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     // バックバッファのRTV
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = gRtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -316,11 +452,14 @@ static void InitD3D12()
                                           gSrvHeap->GetCPUDescriptorHandleForHeapStart());
     }
 
+    // デバッグテキスト用リソース
+    InitDebugText();
+
     // ルートシグネチャ: [0]=32bit定数(b0), [1]=SRVテーブル(t0), 静的サンプラー(s0)
     {
         D3D12_DESCRIPTOR_RANGE range = {};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 1;
+        range.NumDescriptors = 2; // t0=蓄積RT, t1=デバッグテキスト
         range.BaseShaderRegister = 0;
 
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -366,6 +505,7 @@ static void InitD3D12()
     ComPtr<ID3DBlob> vsThreshold = CompileShader(L"shaders.hlsl", "VSThreshold", "vs_5_0");
     ComPtr<ID3DBlob> psThreshold = CompileShader(L"shaders.hlsl", "PSThreshold", "ps_5_0");
     ComPtr<ID3DBlob> psUi        = CompileShader(L"shaders.hlsl", "PSUi",        "ps_5_0");
+    ComPtr<ID3DBlob> psDbg       = CompileShader(L"shaders.hlsl", "PSDebugText", "ps_5_0");
 
     // 共通PSO設定
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
@@ -431,6 +571,11 @@ static void InitD3D12()
 
         ThrowIfFailed(gDevice->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&gPsoUi)),
                       "CreateGraphicsPipelineState(Ui)");
+
+        // Pass4 PSO: デバッグテキスト。ブレンド設定はUIと同じなのでPSだけ差し替え
+        p.PS = { psDbg->GetBufferPointer(), psDbg->GetBufferSize() };
+        ThrowIfFailed(gDevice->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&gPsoDbg)),
+                      "CreateGraphicsPipelineState(DebugText)");
     }
 
     // コマンドアロケーター / リスト / フェンス
@@ -504,7 +649,40 @@ static void Render()
     params.screenH        = (float)kHeight;
     params.dist01         = gDistance / kDistanceMax;
     params.blend01        = (gBlend - kBlendMin) / (kBlendMax - kBlendMin);
+    params.dbgW           = (float)kDbgW;
+    params.dbgH           = (float)kDbgH;
     gCmdList->SetGraphicsRoot32BitConstants(0, sizeof(Params) / 4, &params, 0);
+
+    //--- Pass 0: cbuffer Params の中身をGDIで描いてテクスチャへ転送 ---
+    {
+        UpdateDebugText(params);
+
+        D3D12_RESOURCE_BARRIER toCopy = Transition(gDbgTex.Get(),
+                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST);
+        gCmdList->ResourceBarrier(1, &toCopy);
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource        = gDbgTex.Get();
+        dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource                          = gDbgUpload.Get();
+        src.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_B8G8R8A8_UNORM;
+        src.PlacedFootprint.Footprint.Width    = kDbgW;
+        src.PlacedFootprint.Footprint.Height   = kDbgH;
+        src.PlacedFootprint.Footprint.Depth    = 1;
+        src.PlacedFootprint.Footprint.RowPitch = kDbgPitch;
+
+        gCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        D3D12_RESOURCE_BARRIER toSRV = Transition(gDbgTex.Get(),
+                                                  D3D12_RESOURCE_STATE_COPY_DEST,
+                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        gCmdList->ResourceBarrier(1, &toSRV);
+    }
 
     //--- Pass 1: 蓄積RTにメタボールパーティクルを加算描画 ---
     {
@@ -551,6 +729,10 @@ static void Render()
 
         //--- Pass 3: スライダーUIをアルファ合成で重ねる ---
         gCmdList->SetPipelineState(gPsoUi.Get());
+        gCmdList->DrawInstanced(3, 1, 0, 0);
+
+        //--- Pass 4: cbuffer Params のデバッグ表示を左上に重ねる ---
+        gCmdList->SetPipelineState(gPsoDbg.Get());
         gCmdList->DrawInstanced(3, 1, 0, 0);
 
         D3D12_RESOURCE_BARRIER toPresent = Transition(gBackBuffers[gFrameIndex].Get(),

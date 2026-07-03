@@ -12,6 +12,8 @@
 //     でしきい値処理し、塗りと輪郭を分ける
 //   Pass 3 (UI):
 //     スライダー2本をピクセルシェーダーで直接描画してアルファ合成する
+//   Pass 4 (デバッグ表示):
+//     C++側でGDI描画した cbuffer Params の内容テクスチャを左上に合成する
 //
 // フィールド関数について:
 //   記事は逆二乗 (a = _Scale / d^2) だが、ここでは「ブレンド距離」を
@@ -36,10 +38,13 @@ cbuffer Params : register(b0)
     float gScreenH;
     float gDist01;         // スライダー1のつまみ位置 [0,1]
     float gBlend01;        // スライダー2のつまみ位置 [0,1]
+    float gDbgW;           // デバッグテキストテクスチャのサイズ (px)
+    float gDbgH;
 };
 
-Texture2D    gAccum : register(t0); // Pass1 の蓄積結果 (RenderTexture 相当)
-SamplerState gSamp  : register(s0);
+Texture2D    gAccum  : register(t0); // Pass1 の蓄積結果 (RenderTexture 相当)
+Texture2D    gDbgTex : register(t1); // デバッグテキスト (C++側でGDI描画、白文字)
+SamplerState gSamp   : register(s0);
 
 //----------------------------------------------------------------------------
 // Pass 1: メタボールパーティクル (加算合成で蓄積)
@@ -159,4 +164,26 @@ float4 PSUi(VSOut2 i) : SV_Target
 
     clip(col.a - 0.003); // UI以外のピクセルは棄却
     return col;          // ブレンドは (ONE, INV_SRC_ALPHA)
+}
+
+//----------------------------------------------------------------------------
+// Pass 4: cbuffer Params のデバッグ表示 (左上)
+//   C++側でGDIによりテキストを描いたテクスチャ (白文字/黒地) を、
+//   Rチャンネルを不透明度とみなして半透明の黒パネル付きで合成する
+//----------------------------------------------------------------------------
+static const float2 kDbgOrigin = float2(12.0, 12.0); // パネル左上の位置 (px)
+
+float4 PSDebugText(VSOut2 i) : SV_Target
+{
+    float2 px    = i.uv * float2(gScreenW, gScreenH);
+    float2 local = px - kDbgOrigin;
+
+    // パネル矩形の外は棄却
+    clip(local);
+    clip(float2(gDbgW, gDbgH) - local);
+
+    float v = gDbgTex.Sample(gSamp, local / float2(gDbgW, gDbgH)).r;
+
+    // 白文字 (プリマルチプライド) + 読みやすさのための半透明黒パネル
+    return float4(v, v, v, saturate(v + 0.45));
 }
