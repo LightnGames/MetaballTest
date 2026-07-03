@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:techblog.kayac.com)",
+      "PowerShell($vswhere = \"${env:ProgramFiles\\(x86\\)}\\\\Microsoft Visual Studio\\\\Installer\\\\vswhere.exe\"; if \\(Test-Path $vswhere\\) { & $vswhere -latest -property installationPath } else { \"no vswhere\" }; \\(Get-Command cmake -ErrorAction SilentlyContinue\\).Source)"
+    ]
+  }
+}
