@@ -45,11 +45,11 @@ exe と同じフォルダーに置いてください (シェーダーだけな�
 
 ### Pass 2: しきい値処理 (記事の MetaballRenderer)
 
-フルスクリーントライアングルで蓄積テクスチャをサンプリングし、記事と同じ処理:
+フルスクリーントライアングルで蓄積テクスチャをサンプリングし、しきい値処理して単色で塗ります:
 
 ```hlsl
-clip(color.a - _Cutoff);                              // 外側は破棄
-color = color.a < _Stroke ? _StrokeColor : _Color;    // 輪郭と塗りを分ける
+clip(color.a - _Cutoff);  // 外側は破棄
+return kFillColor;        // 内側は単色
 ```
 
 2つのボールが近づくとフィールド値の和がしきい値を超える領域がつながり、
@@ -77,8 +77,7 @@ color = color.a < _Stroke ? _StrokeColor : _Color;    // 輪郭と塗りを分�
 - フィールド計算は Quad 相対 UV ではなく**ワールド空間の距離**で行い、
   Quad は十分大きく (`quadHalf = 1.5`) 取ってフィールドの実質的な打ち切りを
   `particleCutoff` の `clip` に任せています (Quad 境界の段差が輪郭に出ないように)。
-- 輪郭のしきい値 (`_Stroke` 相当) は「表面から一定幅内側」のフィールド値を
-  C++ 側で毎フレーム計算し、B によらず輪郭の太さがほぼ一定になるようにしています。
+- 記事にある輪郭 (`_Stroke`) の表示は省略し、単色塗りにしています。
 
 ## パラメーター
 
@@ -90,7 +89,6 @@ color = color.a < _Stroke ? _StrokeColor : _Color;    // 輪郭と塗りを分�
 | `blend` | — (スライダー2) | 0.08〜0.6 |
 | `particleCutoff` | パーティクル側 `_Cutoff` | 0.001 |
 | `cutoff` | しきい値パス側 `_Cutoff` | 0.25 |
-| `stroke` | `_Stroke` | ブレンド距離から自動計算 |
 
-色は [shaders.hlsl](shaders.hlsl) の `PSThreshold` 内 (`kFillColor` / `kStrokeColor`)、
+色は [shaders.hlsl](shaders.hlsl) の `PSThreshold` 内 (`kFillColor`)、
 スライダーの配置は `shaders.hlsl` と `main.cpp` 双方の定数 (`kTrackLen` など) で調整できます。

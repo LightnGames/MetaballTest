@@ -50,7 +50,6 @@ struct Params
     float blend;           // ブレンド距離 (スライダー2)
     float particleCutoff;  // 記事の _Cutoff (パーティクル側)
     float cutoff;          // 記事の _Cutoff (しきい値側)
-    float stroke;          // 記事の _Stroke
     float screenW;         // 画面サイズ (UI描画用)
     float screenH;
     float dist01;          // スライダー1のつまみ位置 [0,1]
@@ -321,7 +320,6 @@ static void UpdateDebugText(const Params& p)
         { L"blend",          p.blend          },
         { L"particleCutoff", p.particleCutoff },
         { L"cutoff",         p.cutoff         },
-        { L"stroke",         p.stroke         },
         { L"screenW",        p.screenW        },
         { L"screenH",        p.screenH        },
         { L"dist01",         p.dist01         },
@@ -624,7 +622,7 @@ static void Render()
     ID3D12DescriptorHeap* heaps[] = { gSrvHeap.Get() };
     gCmdList->SetDescriptorHeaps(1, heaps);
 
-    // シェーダー定数 (記事の _Cutoff / _Stroke に相当する値ほか)
+    // シェーダー定数 (記事の _Cutoff に相当する値ほか)
     Params params = {};
     params.distance       = gDistance;
     params.aspect         = (float)kWidth / (float)kHeight;
@@ -635,16 +633,6 @@ static void Render()
     params.blend          = gBlend;
     params.particleCutoff = 0.001f;
     params.cutoff         = 0.25f;
-    // 輪郭(ストローク)のしきい値: 指数カーネルはブレンド距離Bで山の高さが
-    // 変わるため、固定値だとBによって輪郭の太さが大きく変化してしまう。
-    // 「表面から kStrokeWidth 内側」のフィールド値を計算して、Bによらず
-    // ほぼ一定の太さの輪郭になるようにする。
-    {
-        const float kStrokeWidth = 0.04f; // 輪郭の太さ (ワールド単位)
-        const float r  = params.ballRadius;
-        const float ri = r - kStrokeWidth;
-        params.stroke = params.cutoff * expf((r * r - ri * ri) / (gBlend * gBlend));
-    }
     params.screenW        = (float)kWidth;
     params.screenH        = (float)kHeight;
     params.dist01         = gDistance / kDistanceMax;

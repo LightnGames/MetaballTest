@@ -6,10 +6,8 @@
 //     各メタボールを Quad として描画し、中心からの距離に応じたフィールド値を
 //     加算ブレンドでオフスクリーンRTに蓄積する (記事の Σ の実装)
 //   Pass 2 (MetaballRenderer 相当):
-//     蓄積結果に対して
-//       clip(color.a - _Cutoff);
-//       color = color.a < _Stroke ? _StrokeColor : _Color;
-//     でしきい値処理し、塗りと輪郭を分ける
+//     蓄積結果に対して clip(color.a - _Cutoff) でしきい値処理し、
+//     内側を単色で塗る
 //   Pass 3 (UI):
 //     スライダー2本をピクセルシェーダーで直接描画してアルファ合成する
 //   Pass 4 (デバッグ表示):
@@ -33,7 +31,6 @@ cbuffer Params : register(b0)
     float gBlend;          // ブレンド距離 B (スライダー2)
     float gParticleCutoff; // 記事の _Cutoff (パーティクル側)
     float gCutoff;         // 記事の _Cutoff (しきい値パス側)
-    float gStroke;         // 記事の _Stroke
     float gScreenW;        // 画面サイズ (UI描画用)
     float gScreenH;
     float gDist01;         // スライダー1のつまみ位置 [0,1]
@@ -106,14 +103,13 @@ VSOut2 VSThreshold(uint vid : SV_VertexID)
 
 float4 PSThreshold(VSOut2 i) : SV_Target
 {
-    static const float4 kStrokeColor = float4(0.85, 0.96, 1.00, 1.0); // 輪郭色
-    static const float4 kFillColor   = float4(0.20, 0.55, 0.95, 1.0); // 内側の色
+    static const float4 kFillColor = float4(0.20, 0.55, 0.95, 1.0); // メタボールの色
 
     float4 color = gAccum.Sample(gSamp, i.uv);
 
-    // 記事の MetaballRenderer と同じしきい値処理
+    // しきい値処理: フィールド値の和が _Cutoff 未満のピクセルは棄却し、単色で塗る
     clip(color.a - gCutoff);
-    return (color.a < gStroke) ? kStrokeColor : kFillColor;
+    return kFillColor;
 }
 
 //----------------------------------------------------------------------------
