@@ -7,9 +7,11 @@
 //   Pass 1: メタボール2個を Quad として加算ブレンドでオフスクリーンRTに描画
 //           (記事の MetaBallCamera + RenderTexture に相当)
 //   Pass 2: 蓄積結果にしきい値処理をかけてバックバッファへ描画
-//           (記事の MetaballRenderer に相当)
+//           (記事の MetaballRenderer に相当。表示モードで 単色 / UV / 法線 を切替)
+//   Pass 3: 右上のスライダーUI
+//   Pass 4: 左上のデバッグパネル (cbuffer Params の一覧 + 表示モードメニュー)
 //
-// 操作: マウスホイール回転で2つのメタボールの距離を変更 / ESCで終了
+// 操作: 右上のスライダーで距離とブレンド距離、左上のメニューで表示モードを変更 / ESCで終了
 //----------------------------------------------------------------------------
 
 #define WIN32_LEAN_AND_MEAN
@@ -56,6 +58,7 @@ struct Params
     float blend01;         // スライダー2のつまみ位置 [0,1]
     float dbgW;            // デバッグテキストテクスチャのサイズ (px)
     float dbgH;
+    UINT  viewMode;        // 表示モード (kViewModeNames の添字)
 };
 
 //----------------------------------------------------------------------------
@@ -66,7 +69,7 @@ static ComPtr<ID3D12Device>        gDevice;
 static ComPtr<ID3D12CommandQueue>  gQueue;
 static ComPtr<IDXGISwapChain3>     gSwapChain;
 static ComPtr<ID3D12DescriptorHeap> gRtvHeap;   // [0..1]=バックバッファ, [2]=蓄積RT
-static ComPtr<ID3D12DescriptorHeap> gSrvHeap;   // [0]=蓄積RTのSRV
+static ComPtr<ID3D12DescriptorHeap> gSrvHeap;   // [0]=蓄積RT, [1]=デバッグテキストのSRV
 static UINT                        gRtvStride = 0;
 static ComPtr<ID3D12Resource>      gBackBuffers[kFrameCount];
 static ComPtr<ID3D12Resource>      gAccumTex;
@@ -98,13 +101,26 @@ static const int kHitHalfH = 16;  // ヒットテストの上下半幅
 static int gDrag = 0;             // 0=なし, 1=スライダー1, 2=スライダー2
 
 //----------------------------------------------------------------------------
-// デバッグテキスト表示 (cbuffer Params の中身を左上に描く)
-//   GDIでDIBに白文字を描き、毎フレームテクスチャへアップロードして
+// デバッグパネル (左上: cbuffer Params の一覧 + 表示モードメニュー)
+//   GDIでDIBに文字を描き、毎フレームテクスチャへアップロードして
 //   シェーダー (PSDebugText) で合成する
 //----------------------------------------------------------------------------
-static const UINT kDbgW     = 256;       // テクスチャサイズ
-static const UINT kDbgH     = 248;
-static const UINT kDbgPitch = kDbgW * 4; // 1024 = D3D12の256アライン要件を満たす
+// 表示モード (shaders.hlsl の VIEW_* と並びを一致させること)
+static const wchar_t* const kViewModeNames[] = { L"通常", L"UV", L"法線" };
+static const int kViewModeCount = _countof(kViewModeNames);
+static UINT gViewMode = 0;
+
+// パネルのレイアウト (px)。パネル位置は shaders.hlsl の kDbgOrigin と一致させること
+static const int  kDbgX         = 12;  // パネル左上の画面座標
+static const int  kDbgY         = 12;
+static const int  kDbgListY     = 24;  // cbuffer一覧の先頭行 (以下、Yはパネル内座標)
+static const int  kDbgLineH     = 15;  // cbuffer一覧の行の高さ
+static const int  kDbgListLines = sizeof(Params) / 4; // 一覧の行数 (Params の1メンバー = 1行)
+static const int  kMenuY        = kDbgListY + kDbgListLines * kDbgLineH + 32; // メニュー先頭項目
+static const int  kMenuRowH     = 20;  // メニュー1項目の高さ (クリック判定の単位)
+static const UINT kDbgW         = 256; // テクスチャサイズ
+static const UINT kDbgH         = kMenuY + kViewModeCount * kMenuRowH + 6;
+static const UINT kDbgPitch     = kDbgW * 4; // 1024 = D3D12の256アライン要件を満たす
 
 static ComPtr<ID3D12Resource> gDbgTex;              // シェーダーが読むテクスチャ
 static ComPtr<ID3D12Resource> gDbgUpload;           // CPU書き込み用アップロードバッファ
@@ -158,6 +174,18 @@ static void DragSliderTo(int x)
 }
 
 //----------------------------------------------------------------------------
+// 表示モードメニューのヒットテスト。当たった項目番号 (= 表示モード)、外れは -1
+//----------------------------------------------------------------------------
+static int HitViewMenu(int x, int y)
+{
+    const int lx = x - kDbgX;
+    const int ly = y - kDbgY - kMenuY;
+    if (lx < 0 || lx >= (int)kDbgW || ly < 0) return -1;
+    const int item = ly / kMenuRowH;
+    return (item < kViewModeCount) ? item : -1;
+}
+
+//----------------------------------------------------------------------------
 // ウィンドウプロシージャ
 //----------------------------------------------------------------------------
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -165,13 +193,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg)
     {
     case WM_LBUTTONDOWN:
-        gDrag = HitSlider(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+    {
+        const int x = GET_X_LPARAM(lParam);
+        const int y = GET_Y_LPARAM(lParam);
+
+        const int menuItem = HitViewMenu(x, y);
+        if (menuItem >= 0) gViewMode = (UINT)menuItem;
+
+        gDrag = HitSlider(x, y);
         if (gDrag != 0)
         {
             SetCapture(hwnd); // ウィンドウ外までドラッグしても追従させる
-            DragSliderTo(GET_X_LPARAM(lParam));
+            DragSliderTo(x);
         }
         return 0;
+    }
     case WM_MOUSEMOVE:
         if (gDrag != 0) DragSliderTo(GET_X_LPARAM(lParam));
         return 0;
@@ -234,8 +270,8 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* res,
 //----------------------------------------------------------------------------
 static void InitDebugText()
 {
-    // GDI: 32bpp トップダウンDIB。白文字/黒地で描き、Rチャンネルを
-    // シェーダー側で不透明度として使う
+    // GDI: 32bpp トップダウンDIB。黒地に文字を描き、シェーダー側で
+    // そのままプリマルチプライド色として使う
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth       = (LONG)kDbgW;
@@ -253,7 +289,6 @@ static void InitDebugText()
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     SelectObject(gDbgDC, font);
-    SetTextColor(gDbgDC, RGB(255, 255, 255));
     SetBkMode(gDbgDC, TRANSPARENT);
 
     // シェーダーが読むテクスチャ (DIBと同じ BGRA 並びのフォーマット)
@@ -307,7 +342,8 @@ static void InitDebugText()
 }
 
 //----------------------------------------------------------------------------
-// cbuffer Params の中身をGDIで描いてアップロードバッファへ書き込む
+// デバッグパネル (cbuffer Params の一覧 + 表示モードメニュー) をGDIで描いて
+// アップロードバッファへ書き込む
 // (毎フレームGPU完了を待つ方式なので、この時点でバッファはGPU未使用)
 //----------------------------------------------------------------------------
 static void UpdateDebugText(const Params& p)
@@ -331,12 +367,26 @@ static void UpdateDebugText(const Params& p)
     memset(gDbgBits, 0, (size_t)kDbgPitch * kDbgH); // DIBのストライド == kDbgPitch
 
     wchar_t line[64];
+    SetTextColor(gDbgDC, RGB(255, 255, 255));
     swprintf_s(line, L"cbuffer Params");
     TextOutW(gDbgDC, 8, 6, line, (int)wcslen(line));
     for (int i = 0; i < (int)_countof(items); ++i)
     {
         swprintf_s(line, L" %-15s: %9.4f", items[i].name, items[i].value);
-        TextOutW(gDbgDC, 8, 24 + i * 15, line, (int)wcslen(line));
+        TextOutW(gDbgDC, 8, kDbgListY + i * kDbgLineH, line, (int)wcslen(line));
+    }
+    swprintf_s(line, L" %-15s: %9u", L"viewMode", p.viewMode); // 整数なので書式だけ別
+    TextOutW(gDbgDC, 8, kDbgListY + (int)_countof(items) * kDbgLineH, line, (int)wcslen(line));
+
+    // 表示モードメニュー (選択中の項目を強調色で描く)
+    swprintf_s(line, L"表示モード (クリックで切替)");
+    TextOutW(gDbgDC, 8, kMenuY - kMenuRowH + 2, line, (int)wcslen(line));
+    for (int i = 0; i < kViewModeCount; ++i)
+    {
+        const bool selected = (i == (int)p.viewMode);
+        SetTextColor(gDbgDC, selected ? RGB(89, 166, 255) : RGB(170, 170, 170));
+        swprintf_s(line, L" %s %s", selected ? L"●" : L"○", kViewModeNames[i]);
+        TextOutW(gDbgDC, 8, kMenuY + i * kMenuRowH + 2, line, (int)wcslen(line));
     }
     GdiFlush(); // GDIのバッチを吐き出してからDIBのビットを読む
 
@@ -626,12 +676,12 @@ static void Render()
     Params params = {};
     params.distance       = gDistance;
     params.aspect         = (float)kWidth / (float)kHeight;
-    // Quadは十分大きく取り、フィールドの実質的な打ち切りは particleCutoff の
-    // clip に任せる (Quad境界での打ち切り段差が輪郭に出ないようにする)
-    params.quadHalf       = 1.5f;
+    // フィールドの打ち切り段差は輪郭や法線の継ぎ目になるので、particleCutoff は
+    // 十分小さくし、Quad はその打ち切り半径 (ブレンド距離最大時に約1.7) を含む大きさにする
+    params.quadHalf       = 2.0f;
     params.ballRadius     = 0.2f;
     params.blend          = gBlend;
-    params.particleCutoff = 0.001f;
+    params.particleCutoff = 0.0001f;
     params.cutoff         = 0.25f;
     params.screenW        = (float)kWidth;
     params.screenH        = (float)kHeight;
@@ -639,9 +689,10 @@ static void Render()
     params.blend01        = (gBlend - kBlendMin) / (kBlendMax - kBlendMin);
     params.dbgW           = (float)kDbgW;
     params.dbgH           = (float)kDbgH;
+    params.viewMode       = gViewMode;
     gCmdList->SetGraphicsRoot32BitConstants(0, sizeof(Params) / 4, &params, 0);
 
-    //--- Pass 0: cbuffer Params の中身をGDIで描いてテクスチャへ転送 ---
+    //--- Pass 0: デバッグパネル (cbuffer Params の一覧 + 表示モードメニュー) をGDIで描いてテクスチャへ転送 ---
     {
         UpdateDebugText(params);
 
@@ -719,7 +770,7 @@ static void Render()
         gCmdList->SetPipelineState(gPsoUi.Get());
         gCmdList->DrawInstanced(3, 1, 0, 0);
 
-        //--- Pass 4: cbuffer Params のデバッグ表示を左上に重ねる ---
+        //--- Pass 4: デバッグパネルを左上に重ねる ---
         gCmdList->SetPipelineState(gPsoDbg.Get());
         gCmdList->DrawInstanced(3, 1, 0, 0);
 
